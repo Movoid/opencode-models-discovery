@@ -407,7 +407,7 @@ For each discovered model, the plugin reads:
 
 AIProxy's prices are already USD per million tokens; they are not rescaled. Finite non-negative prices, including zero, are preserved. Missing or malformed fields do not overwrite existing catalog values. `pricing.cache_write_5m_per_1m_usd` is currently ignored because its duration-specific meaning does not map unambiguously to OpenCode's generic cache-write cost.
 
-The plugin does not infer total context by adding `max_input_tokens` and `max_output_tokens`. It updates input/output limits only when a valid context limit is already available. Models with no models.dev match therefore retain the conservative host context default in V2, and V1 leaves an incomplete limit unset.
+The plugin does not infer total context by adding `max_input_tokens` and `max_output_tokens`. On V2 OpenAI-compatible providers, a missing context uses the host default without losing a declared input or output limit. V1 requires a usable context before publishing limits.
 
 #### Reasoning effort variants
 
@@ -471,7 +471,7 @@ Use `modelInfoFormat: "omniroute"` for an [OmniRoute](https://github.com/diegoso
 }
 ```
 
-For each discovered model, the plugin maps `context_length`, `max_input_tokens`, and `max_output_tokens` to `limit.context`, `limit.input`, and `limit.output` when context is present. It maps `input_modalities` and `output_modalities` to lower-case OpenCode modalities, translating `SPEECH` to `audio` and ignoring unsupported values. When no valid input modalities are reported, `capabilities.vision: true` enables `text` and `image` input. The plugin also maps OmniRoute's `attachment`, `reasoning`, `tool_calling`, `structured_output`, and `temperature` capability booleans.
+For each discovered model, the plugin maps `context_length`, `max_input_tokens`, and `max_output_tokens` to `limit.context`, `limit.input`, and `limit.output` independently on OpenAI-compatible V2 providers. It maps `input_modalities` and `output_modalities` to lower-case OpenCode modalities, translating `SPEECH` to `audio` and ignoring unsupported values. When no valid input modalities are reported, `capabilities.vision: true` enables `text` and `image` input. The plugin also maps OmniRoute's `attachment`, `reasoning`, `tool_calling`, `structured_output`, and `temperature` capability booleans.
 
 When OmniRoute advertises service-tier metadata through `capabilities.service_tiers`, `service_tiers`, or `additional_speed_tiers`, supported tiers become OpenCode variants with request-body overlays. `priority` and `fast` are normalized to a `fast` variant that sends `service_tier: "fast"`; `flex` becomes a `flex` variant. Reasoning-effort variants remain available alongside service-tier variants. Missing or malformed metadata is left unset.
 
@@ -524,7 +524,7 @@ Use `modelInfoFormat: "bifrost"` for a Bifrost AI Gateway provider. It reads Bif
 }
 ```
 
-For each discovered model, the plugin maps Bifrost's reported `context_length`, `max_input_tokens`, and `max_output_tokens` to `limit.context`, `limit.input`, and `limit.output` when context is available. It maps `architecture.input_modalities` and `architecture.output_modalities` to lower-case OpenCode modalities, translating Bifrost's `SPEECH` value to `audio` and ignoring unsupported values. Bifrost's `pricing.prompt` and `pricing.completion` are USD per-token rates; the plugin converts them to OpenCode's USD per-million-token `cost.input` and `cost.output` values. Costs are added only when both rates are available.
+For each discovered model, the plugin maps Bifrost's reported `context_length`, `max_input_tokens`, and `max_output_tokens` to `limit.context`, `limit.input`, and `limit.output` independently on OpenAI-compatible V2 providers. It maps `architecture.input_modalities` and `architecture.output_modalities` to lower-case OpenCode modalities, translating Bifrost's `SPEECH` value to `audio` and ignoring unsupported values. Bifrost's `pricing.prompt` and `pricing.completion` are USD per-token rates; the plugin converts them to OpenCode's USD per-million-token `cost.input` and `cost.output` values. Costs are added only when both rates are available.
 
 When Bifrost reports reasoning metadata with `reasoning.supported_efforts`, the plugin maps recognized efforts (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`) to OpenCode reasoning variants and marks the model as reasoning-capable. Other pricing fields, scoped pricing overrides, and tiered pricing are not represented by this format.
 
@@ -559,7 +559,7 @@ When model info is available, the plugin uses LiteLLM `model_info` fields to pop
 
 - A non-empty `display_name` is used as the display name when `smartModelName` is enabled.
 - `max_input_tokens` (or `max_tokens` fallback) becomes `limit.context` and `limit.input`; `max_output_tokens` (or `max_tokens` when strictly smaller than context) becomes `limit.output`, bounded by the context and default token limit
-- `modalities.input` and `modalities.output` become `modalities`, normalized to lowercase (`speech` becomes `audio`) and limited to `text`, `audio`, `image`, `video`, and `pdf`; the undeclared side defaults to `["text"]`, but a declared side that contains no supported values makes the whole declaration untrustworthy and the existing configuration is left untouched
+- `modalities.input` and `modalities.output` become `modalities`, normalized to lowercase (`speech` becomes `audio`) and limited to `text`, `audio`, `image`, `video`, and `pdf`; the undeclared side defaults to `["text"]`, and V2 OpenAI-compatible discovery preserves a usable direction even if the other cannot be parsed
 - `supports_vision: true` without `modalities` falls back to input `["text", "image"]`
 - `supports_reasoning` enables `reasoning`
 - `supports_*_reasoning_effort` and `supported_openai_params` create reasoning `variants`: `low`, `medium`, and `high` are kept unless the matching flag is explicitly `false`, while `none`, `minimal`, `xhigh`, and `max` require the flag to be `true`
@@ -659,7 +659,7 @@ Use `modelInfoFormat: "models.dev"` to enrich discovered models from the public 
 
 This project is not affiliated with, endorsed by, or sponsored by [models.dev](https://models.dev/).
 
-This does not require `modelInfoEndpoint`, because the source is fixed to `https://models.dev/models.json`:
+By default, this uses `https://models.dev/models.json`, so `modelInfoEndpoint` is optional:
 
 ```jsonc
 {
@@ -690,9 +690,17 @@ When a discovered model can be matched to models.dev metadata, the plugin may po
 - `temperature`
 - `modalities`
 
-The current models.dev data uses a flat `provider/model`-keyed object. Its `limit` object is singular, and its `context`, `input`, and `output` fields are independently optional. `structured_output` and `temperature` may also be omitted; the plugin leaves omitted fields unset rather than inferring `false`. The current models.dev dataset does not provide `variants` metadata.
+The flat models.dev index is keyed by `provider/model`. Its `limit` object is singular, and its `context`, `input`, and `output` fields are independently optional. `structured_output` and `temperature` may also be omitted; the plugin leaves omitted fields unset rather than inferring `false`.
 
-For gateways that expose inline limits on their `/v1/models` entries, those values take precedence over matching models.dev limits. The plugin reads `context_length` or `max_context_length` for the context window and `max_completion_tokens` or `max_output_tokens` for the output budget, then fills any remaining gap from models.dev. This keeps gateways that front several upstreams (for example a LiteLLM pool or a custom router) authoritative for what their own routes accept, while models.dev still supplies names and capabilities. A models.dev input limit is bounded by the effective context window.
+On OpenCode V2, the OpenAI Chat Completions and Responses packages listed below also use `reasoning_options` to create named `reasoningEffort` variants. With the default index, `https://models.dev/api.json` fills missing effort declarations from the flat catalog. An explicit empty or default-only effort list keeps ordinary reasoning defaults without consulting the second source. Effort matching requires an exact ID or a unique bare ID; fuzzy matching is used only for ordinary metadata. If the flat catalog is unavailable, the separate provider catalog can still supply an exact match, but cannot establish that a bare ID is absent from the flat catalog.
+
+A configured mirror replaces both public reference URLs and can use flat model keys or provider branches. Ordinary metadata follows the row’s model ID (or its key). Conflicting effort declarations for the same ID are ambiguous. A missing or invalid field falls back independently: a bad output limit does not invalidate the context limit, other metadata, or other models. V1 and non-OpenAI providers do not use named effort enrichment.
+
+V2 can reuse a cached gateway model list without asking the gateway for it again. On the OpenAI path, models.dev metadata and efforts are resolved separately from the current reference catalog, using the process-local reference cache when available. They are not taken from old gateway-list enrichment data.
+
+If an ordinary list refresh fails, V2 can reuse the last list held in memory for the same base URL and list endpoint. It applies the current filters and metadata settings instead of reusing the previous variants. This does not renew the persistent cache or apply to Codex mode.
+
+For gateways that expose inline limits on their `/v1/models` entries, `context_length` or `max_context_length` sets the context window and `max_completion_tokens` or `max_output_tokens` sets the output budget. V2 OpenAI-compatible providers also read the gateway's `max_input_tokens`. Each field takes precedence over its models.dev counterpart; the final input and output budgets are bounded by the effective context window.
 
 Matching is intentionally conservative:
 
@@ -704,7 +712,33 @@ If models.dev cannot be fetched, or if no safe match is found, discovery still s
 
 Because this option makes a public network request to models.dev during discovery, it is disabled unless explicitly configured.
 
-For providers with custom metadata paths or non-standard behavior:
+### Codex Catalog via CLIProxyAPI (OpenCode V2)
+
+Set `codexCatalog: true` on a provider whose gateway serves a Codex catalog. Any adapter package can use the catalog limits. Configure a gateway key directly or through a key/env connection. With no key or active connection, discovery sends anonymous requests. An active OAuth or unresolved key connection blocks gateway discovery.
+
+The plugin also publishes catalog-declared effort variants for OpenAI Chat Completions and Responses adapters. Known adapters include `aisdk:@ai-sdk/openai`, `aisdk:@ai-sdk/openai-compatible` and the native `@opencode/ai/providers/` entry points `openai`, `openai/chat`, `openai/responses`, `openai-compatible`, `openai-compatible/responses` and `openai-compatible-responses`. Other packages keep their existing effort handling. The provider package continues to select the generation protocol.
+
+```jsonc
+"modelsDiscovery": {
+  "enabled": true,
+  "modelInfoFormat": "models.dev",
+  "codexCatalog": true
+}
+```
+
+The ordinary model list controls what's imported. By default it appends `/models` to the provider's `baseURL`, including any path prefix; an explicit same-origin `endpoint` overrides it. Use a `baseURL` without a query or fragment so the runtime can append its own request path. The supplementary request adds `client_version` and joins Codex `slug` to the ordinary model ID exactly. Following native Codex, `context_window` takes precedence over `max_context_window`; CPA's optional `max_tokens` fills the output limit.
+
+For each limit, discovery uses the Codex declaration first, then live format-specific metadata, then inline limits from the ordinary list. Inferred limits and static maxima (for example, models.dev limits, Ollama architecture limits, or LM Studio's unloaded-model maximum) only fill missing fields. Defaults and context bounds apply after merging. Without the Codex opt-in, a configured metadata format uses the same per-field merge, starting with its own live metadata. Without either option, ordinary discovery retains the host defaults. Catalog requests stay on the configured origin and do not follow redirects, with or without a key. The default public index and cross-origin reference indexes are fetched without the gateway key. An explicit same-origin `modelInfoEndpoint` for `models.dev` or `aiproxy` uses the same gateway policy and bypasses the shared reference cache.
+
+The first request uses a bundled Codex version. Only when this mode is used, discovery checks the official npm registry for `@openai/codex@latest` in the background, at most once every six hours. Later requests use the newer of that result and the bundled version. Registry failures keep the last usable version and never delay discovery. The registry request sends no gateway key and does not install or run Codex.
+
+Advertised efforts replace the ordinary reasoning choices without removing unrelated options such as Fast and Flex. If an effort ID conflicts with an existing option, the effort gets a separate ID such as `codex-fast` (with a numeric suffix if needed) without changing the request value. They use Codex's request values: `ultra` resolves to a supported `multi_agent_reasoning_effort`, then `max`, the last non-`ultra` choice, or `medium`; `persistent` sends `disabled`. This does not activate Codex's multi-agent workflow. Custom efforts pass through. An empty list does not produce generic reasoning variants, and the default effort when no variant is selected is unchanged. These are gateway declarations, not measurements of account limits.
+
+An exact Codex effort declaration takes precedence for each model, whether the list is empty or nonempty. If the supplementary request fails or lacks a model list, ordinary discovery still works. Within a usable list, a row without a matching slug contributes nothing; an invalid or missing declaration falls back for that field only. A previous Codex catalog is never reused. Effort metadata does not change reasoning-text replay settings. Codex mode bypasses the ordinary per-provider cache. It uses the same refresh events as normal discovery. After switching a gateway key, run `/models-discovery-refresh --force` and wait for the existing result notification before using the discovered models; OpenCode can switch the active key before the refreshed list is ready.
+
+This populates OpenCode's runtime catalog, not `opencode.jsonc`. Existing definitions take precedence, including built-in models, manually configured models, and aliases. Use a dedicated provider ID such as `cpa` if you want discovery to manage models whose IDs are also in OpenCode's built-in `openai` catalog. `pruneMissing` does not remove existing host models in Codex mode; discovered models are replaced on refresh, and a failed ordinary list leaves only the host-owned models.
+
+### Custom Metadata Endpoints
 
 ```jsonc
 {

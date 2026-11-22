@@ -1,9 +1,9 @@
 import type { LMStudioInventoryModel } from '../../types'
-import type { ModelEnricher } from '../../core/model-enrichment'
-import { createModelLimits } from '../../core/model-types'
+import { enrichmentLimits, type ModelEnricher } from '../../core/model-enrichment'
+import type { ModelLimitDraft } from '../../core/model-types'
 
 function hasUsableNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }
 
 function getModelKey(model: LMStudioInventoryModel): string | undefined {
@@ -11,15 +11,17 @@ function getModelKey(model: LMStudioInventoryModel): string | undefined {
 }
 
 function getLoadedContextLimit(model: LMStudioInventoryModel): number | undefined {
-  const limits = (model.loaded_instances ?? [])
-    .map(instance => instance.config?.context_length)
+  if (!Array.isArray(model.loaded_instances)) return undefined
+  const limits = model.loaded_instances
+    .map(instance => instance?.config?.context_length)
     .filter(hasUsableNumber)
 
   return limits.length > 0 ? Math.max(...limits) : undefined
 }
 
 function getReasoningOptions(model: LMStudioInventoryModel): string[] {
-  return model.capabilities?.reasoning?.allowed_options ?? []
+  const options = model.capabilities?.reasoning?.allowed_options
+  return Array.isArray(options) ? options.filter(option => typeof option === 'string') : []
 }
 
 function getReasoningVariants(options: string[]): Record<string, { reasoningEffort: string }> | undefined {
@@ -51,13 +53,14 @@ export function createLMStudioEnricher(data: unknown): ModelEnricher {
   }
 
   return {
-    enrich(model) {
+    enrich(model, options) {
       const inventoryModel = models.get(model.id)
       if (!inventoryModel) return {}
 
       const result: {
         metadataName?: string
-        limit?: { context: number; output: number }
+        limit?: ModelLimitDraft
+        fallbackLimit?: ModelLimitDraft
         modalities?: { input: string[]; output: string[] }
         toolCall?: boolean
         reasoning?: boolean
@@ -67,10 +70,13 @@ export function createLMStudioEnricher(data: unknown): ModelEnricher {
       const displayName = inventoryModel.display_name
       if (typeof displayName === 'string' && displayName.length > 0) result.metadataName = displayName
 
-      const contextLimit = getLoadedContextLimit(inventoryModel) ?? (hasUsableNumber(inventoryModel.max_context_length) ? inventoryModel.max_context_length : undefined)
-      const limits = createModelLimits(contextLimit)
-      if (limits) {
-        result.limit = limits
+      const loadedContext = getLoadedContextLimit(inventoryModel)
+      const maxContext = hasUsableNumber(inventoryModel.max_context_length) ? inventoryModel.max_context_length : undefined
+      if (options.deferLimitNormalization && loadedContext === undefined && maxContext !== undefined) {
+        result.fallbackLimit = { context: maxContext }
+      } else {
+        const limits = enrichmentLimits(options, loadedContext ?? maxContext)
+        if (limits) result.limit = limits
       }
 
       const capabilities = inventoryModel.capabilities && typeof inventoryModel.capabilities === 'object'

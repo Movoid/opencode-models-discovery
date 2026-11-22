@@ -1,12 +1,13 @@
+import { isDeepStrictEqual } from "node:util"
 import { Plugin } from "@opencode/plugin"
 import { createProviderController, type ConfiguredProvider, type Inventory } from "./catalog.js"
-import { discoverInventory, type CatalogProvider } from "./discovery.js"
-import { parseProviderDiscoveryOptions, type ProviderDiscoveryOptions } from "./provider-config.js"
+import { discoverInventory, type InventoryFallbackIdentity, type OrdinaryListSnapshot } from "./discovery.js"
+import { parseProviderDiscoveryOptions, usesModelsDevEfforts, type ProviderDiscoveryOptions } from "./provider-config.js"
 import { registerDiscoveryTools, type DiscoveryStatusInput, type DiscoveryStatusProviderReport, formatStatusReport } from "./tools.js"
 import type { RefreshResult } from "./tools.js"
 import { createV2StorageCache } from "./storage-cache.js"
 import { discoveryCacheKey, isDiscoveryCacheFresh, sanitizeSensitiveFields } from "../core/discovery-cache.js"
-import { resolveProviderCredential } from "./credential-resolver.js"
+import { resolveGatewayKey, resolveProviderCredential } from "./credential-resolver.js"
 import { DiscoveryRpcDefinition, type RpcCacheEntry } from "./rpc.js"
 import { applyModelOverride, deleteModelOverride, listModelOverrides, setModelOverride } from "./overrides.js"
 
@@ -18,6 +19,7 @@ interface ListedProvider {
   readonly id?: unknown
   readonly name?: unknown
   readonly package?: unknown
+  readonly integrationID?: unknown
   readonly settings?: unknown
 }
 
@@ -52,6 +54,8 @@ async function configuredProviders(ctx: Plugin.Context): Promise<{
         id: entry.id,
         name: typeof entry.name === "string" ? entry.name : undefined,
         package: entry.package,
+        codexCatalog: parsed.codexCatalog,
+        ...(typeof entry.integrationID === "string" ? { integrationID: entry.integrationID } : {}),
         settings,
         pruneMissing: parsed.pruneMissing,
       })
@@ -75,9 +79,11 @@ async function configuredProviders(ctx: Plugin.Context): Promise<{
   return { providers: [], discovery: new Map() }
 }
 
-async function resolveProviderCredentials(ctx: Plugin.Context, providers: readonly CatalogProvider[]): Promise<CatalogProvider[]> {
+async function resolveProviderCredentials(ctx: Plugin.Context, providers: readonly ConfiguredProvider[]): Promise<ConfiguredProvider[]> {
   return Promise.all(providers.map(async (provider) => {
-    const apiKey = await resolveProviderCredential(ctx, provider, integrationID)
+    const apiKey = provider.codexCatalog
+      ? await resolveGatewayKey(ctx, provider)
+      : await resolveProviderCredential(ctx, provider, integrationID)
     return { ...provider, apiKey }
   }))
 }
@@ -87,6 +93,8 @@ export async function setupV2(ctx: Plugin.Context): Promise<() => void> {
   const discovery = new Map<string, ProviderDiscoveryOptions>()
   const controller = createProviderController(ctx, providers, integrationID)
   let baselineInventory: Inventory = new Map()
+  let fallbackIdentities = new Map<string, InventoryFallbackIdentity>()
+  const ordinaryLists = new Map<string, OrdinaryListSnapshot>()
   let transformsRegistration: Promise<void> | undefined
 
   const ensureTransformsRegistered = async (): Promise<void> => {
@@ -94,6 +102,7 @@ export async function setupV2(ctx: Plugin.Context): Promise<() => void> {
       transformsRegistration = Promise.all([
         ctx.integration.transform((draft) => {
           for (const provider of providers) {
+            if (provider.codexCatalog) continue // The host already manages the gateway connection.
             const id = (provider.settings.integrationID as string | undefined) ?? integrationID(provider.id)
             if (!draft.get(id)) {
               draft.update(id, (current) => {
@@ -108,6 +117,7 @@ export async function setupV2(ctx: Plugin.Context): Promise<() => void> {
           }
         }),
         ctx.provider.transform(controller.transform),
+        ctx.model?.transform(controller.transformModels),
       ]).then(async () => {
         try {
           await ctx.integration.reload()
@@ -131,39 +141,51 @@ export async function setupV2(ctx: Plugin.Context): Promise<() => void> {
 
   const refreshInventoryInternal = async (force?: boolean): Promise<RefreshResult> => {
     const resolved = await resolveProviderCredentials(ctx, providers)
-    providers.splice(0, providers.length, ...resolved)
-    const discoveredInventory = await discoverInventory(
+    // Only the legacy provider transform publishes a resolved auth header.
+    // Codex publication uses the original configuration, not the request key.
+    const modelProviders = providers.filter(provider => provider.codexCatalog || usesModelsDevEfforts(provider.package, discovery.get(provider.id)))
+    resolved.forEach((provider, index) => {
+      if (!provider.codexCatalog) providers[index] = provider
+    })
+    const activeIDs = new Set(resolved.map(provider => provider.id))
+    for (const id of ordinaryLists.keys()) {
+      if (!activeIDs.has(id)) ordinaryLists.delete(id)
+    }
+    const ordinarySources: Inventory = new Map()
+    const nextFallbacks = new Map<string, InventoryFallbackIdentity>()
+    const inventory = await discoverInventory(
       resolved,
       discovery,
       fetch,
       ctx.storage ? createV2StorageCache(ctx.storage) : undefined,
-      { force }
+      { force, ordinaryLists, ordinarySources, fallbackIdentities: nextFallbacks }
     )
-    const previousInventory = controller.getInventory()
-    const inventory: Inventory = new Map()
+    const nextBaseline: Inventory = new Map()
     for (const provider of resolved) {
-      const discovered = discoveredInventory.get(provider.id)
-      if (discovered) {
-        inventory.set(provider.id, discovered)
-        baselineInventory.set(provider.id, new Map(discovered))
-      } else {
-        // A failed request is represented by a missing provider entry. Keep the
-        // last known inventory so a transient outage does not erase models.
-        inventory.set(provider.id, previousInventory.get(provider.id) ?? new Map())
+      const id = provider.id
+      let models = inventory.get(id)
+      const identity = nextFallbacks.get(id)
+      if (!models && identity !== undefined && isDeepStrictEqual(identity, fallbackIdentities.get(id))) {
+        models = baselineInventory.get(id)
+      }
+      if (models) {
+        nextBaseline.set(id, new Map(models))
+        inventory.set(id, models)
+      } else if (!provider.codexCatalog) {
+        inventory.set(id, new Map())
       }
     }
-    for (const providerID of [...baselineInventory.keys()]) {
-      if (!resolved.some((provider) => provider.id === providerID)) baselineInventory.delete(providerID)
-    }
+    baselineInventory = nextBaseline
+    fallbackIdentities = nextFallbacks
     const storedOverrides = await listModelOverrides(ctx.storage)
     const overrideByModel = new Map(storedOverrides.map((override) => [`${override.providerID}:${override.modelID}`, override]))
-    for (const [providerID, models] of inventory) {
+    for (const [providerID, models] of [...inventory, ...ordinarySources]) {
       for (const [modelID, model] of models) {
         const override = overrideByModel.get(`${providerID}:${modelID}`) ?? overrideByModel.get(`${providerID}:${model.modelID}`)
         if (override) models.set(modelID, applyModelOverride(model as unknown as Record<string, unknown>, override) as unknown as typeof model)
       }
     }
-    await controller.replaceInventory(inventory)
+    await controller.replaceInventory(inventory, modelProviders, ordinarySources)
     return controller.status()
   }
 

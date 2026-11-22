@@ -1,7 +1,45 @@
-import type { DiscoveredModelDraft, DiscoveredRawModel, ModelLimitDraft } from './model-types'
+import { createModelLimits, type DiscoveredModelDraft, type DiscoveredRawModel, type ModelLimitDraft } from './model-types'
 
 export interface ModelEnrichmentContext {
   readonly filterNonChat: boolean
+  /** Keep supplied fields independent when another source will supply limits. */
+  readonly deferLimitNormalization?: boolean
+}
+
+export function tokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/** Live declarations common to both ordinary and Codex-augmented OpenAI lists. */
+export function advertisedListLimits(model: DiscoveredRawModel, read = tokenCount): ModelLimitDraft {
+  return {
+    context: read(model.context_length) ?? read(model.max_context_length),
+    output: read(model.max_completion_tokens) ?? read(model.max_output_tokens),
+    input: read(model.max_input_tokens),
+  }
+}
+
+/** Read the limit fields shared by the Bifrost and OmniRoute formats. */
+export function inlineFormatLimits(model: DiscoveredRawModel, options: ModelEnrichmentContext): ModelLimitDraft | undefined {
+  const read = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+  const context = read(model.context_length)
+  const output = read(model.max_output_tokens)
+  const input = read(model.max_input_tokens)
+  if (options.deferLimitNormalization) return enrichmentLimits(options, context, output, input)
+  if (context === undefined) return undefined
+  return { context, ...(input === undefined ? {} : { input }), ...(output === undefined ? {} : { output }) }
+}
+
+export function enrichmentLimits(
+  options: ModelEnrichmentContext, context?: number, output?: number, input?: number,
+): ModelLimitDraft | undefined {
+  if (!options.deferLimitNormalization) return createModelLimits(context, output, input)
+  const limits = {
+    ...(tokenCount(context) ? { context } : {}),
+    ...(tokenCount(output) ? { output } : {}),
+    ...(tokenCount(input) ? { input } : {}),
+  }
+  return Object.keys(limits).length ? limits : undefined
 }
 
 export interface ModelEnricherLogger {
@@ -28,6 +66,8 @@ export interface ModelEnrichmentResult {
   readonly metadataName?: string
   readonly capabilities?: Record<string, unknown>
   readonly limit?: ModelLimitDraft
+  /** Inferred or reference limits; used only after live declarations when composing. */
+  readonly fallbackLimit?: ModelLimitDraft
   readonly modalities?: {
     readonly input?: readonly string[]
     readonly output?: readonly string[]

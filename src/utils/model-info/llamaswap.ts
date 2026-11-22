@@ -1,5 +1,4 @@
-import type { ModelEnricher } from '../../core/model-enrichment'
-import { createModelLimits } from '../../core/model-types'
+import { enrichmentLimits, tokenCount, type ModelEnricher } from '../../core/model-enrichment'
 
 function hasUsableNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
@@ -40,28 +39,30 @@ function getLlamaSwapMetadata(rawModel: Record<string, unknown> | undefined): Re
  * so the minimum of all usable values is used; a single declaration is used
  * when only one is present.
  */
-function resolveContextLength(...declarations: unknown[]): number | undefined {
-  const declared = declarations.filter(hasUsableNumber)
-  return declared.length > 0 ? Math.min(...declared) : undefined
+function resolveContextLength(trained?: number, runtime?: number): number | undefined {
+  if (trained === undefined || runtime === undefined) return trained ?? runtime
+  return Math.min(trained, runtime)
 }
 
 export function createLlamaSwapEnricher(_data: unknown): ModelEnricher {
   return {
-    enrich(model) {
+    enrich(model, options) {
       const meta = getRecord(model.meta)
       const llamaSwapMetadata = getLlamaSwapMetadata(model)
-      const context = resolveContextLength(model.context_length, meta?.n_ctx)
+      const read = options.deferLimitNormalization ? tokenCount : (v: unknown) => hasUsableNumber(v) ? v : undefined
+      const context = resolveContextLength(read(model.context_length), read(meta?.n_ctx))
       const result: any = {}
       const name = model.name
       if (typeof name === 'string' && name.trim().length > 0) result.metadataName = name.trim()
-      if (context) {
+      if (context || options.deferLimitNormalization) {
         const input = hasUsableNumber(llamaSwapMetadata?.max_input_tokens)
           ? llamaSwapMetadata.max_input_tokens
           : undefined
         const output = hasNonNegativeNumber(llamaSwapMetadata?.max_output_tokens)
           ? llamaSwapMetadata.max_output_tokens
           : undefined
-        result.limit = createModelLimits(context, output, input)
+        const limit = enrichmentLimits(options, context, output, input)
+        if (limit) result.limit = limit
       }
 
       const architecture = getRecord(model.architecture)

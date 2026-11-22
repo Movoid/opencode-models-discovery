@@ -1,5 +1,6 @@
 export interface ActiveConnection {
   readonly type?: string
+  readonly method?: string
   readonly id?: string
   readonly name?: string
   readonly [key: string]: unknown
@@ -25,8 +26,30 @@ export interface CredentialResolutionContext<TConn = any> {
 
 export interface ProviderForCredentialResolution {
   readonly id: string
+  readonly integrationID?: string
   readonly settings: Record<string, unknown>
-  readonly apiKey?: string
+  readonly apiKey?: string | null
+}
+
+/** An absent key is anonymous; null means the credential cannot be used. Never resolve OAuth. */
+export async function resolveGatewayKey<T extends ActiveConnection>(
+  ctx: CredentialResolutionContext<T>,
+  provider: ProviderForCredentialResolution,
+): Promise<string | null | undefined> {
+  const connection = ctx.integration?.connection
+  if (!connection?.active) return null
+  try {
+    const active = await connection.active(provider.integrationID ?? provider.id)
+    if (active) {
+      if (active.type !== "env" && !(active.type === "credential" && active.method === "key")) return null
+      const value = await connection.resolve?.(active)
+      return value?.type === "key" && value.key?.trim() ? value.key : null
+    }
+    const key = provider.settings.apiKey
+    return typeof key === "string" && key.trim() ? key : undefined
+  } catch {
+    return null
+  }
 }
 
 export async function resolveProviderCredential(

@@ -1,5 +1,4 @@
-import type { ModelEnricher } from '../../core/model-enrichment'
-import { createModelLimits } from '../../core/model-types'
+import { enrichmentLimits, type ModelEnricher } from '../../core/model-enrichment'
 
 const SUPPORTED_MODALITIES = new Set(['text', 'audio', 'image', 'video', 'pdf'])
 const SUPPORTED_REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -54,7 +53,7 @@ function reasoningVariants(value: unknown): Record<string, { reasoningEffort: st
 
 export function createOpenRouterEnricher(_data: unknown): ModelEnricher {
   return {
-    enrich(model) {
+    enrich(model, options) {
       const result: Record<string, unknown> = {}
       const name = model.name
       if (typeof name === 'string' && name.trim().length > 0) {
@@ -66,9 +65,8 @@ export function createOpenRouterEnricher(_data: unknown): ModelEnricher {
       const output = usableNumber(topProvider?.max_completion_tokens)
         ? topProvider.max_completion_tokens
         : undefined
-      if (context) {
-        result.limit = createModelLimits(context, output)
-      }
+      const limit = enrichmentLimits(options, context, output)
+      if (limit) result.limit = limit
 
       const architecture = record(model.architecture)
       const inputModalities = modalities(architecture?.input_modalities)

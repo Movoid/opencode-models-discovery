@@ -1,5 +1,25 @@
 import { ModelInfoFormat } from "../types/plugin-config.js"
 
+const OPENAI_REASONING_PACKAGES = new Set([
+  "@opencode/ai/providers/openai-compatible",
+  "@opencode/ai/providers/openai-compatible/responses",
+  "@opencode/ai/providers/openai-compatible-responses",
+  "@opencode/ai/providers/openai",
+  "@opencode/ai/providers/openai/chat",
+  "@opencode/ai/providers/openai/responses",
+  // OpenCode V2 also uses these specifiers when it migrates legacy npm config.
+  "aisdk:@ai-sdk/openai",
+  "aisdk:@ai-sdk/openai-compatible",
+])
+
+export function supportsOpenAIReasoning(specifier: string): boolean {
+  return OPENAI_REASONING_PACKAGES.has(specifier)
+}
+
+export function usesModelsDevEfforts(specifier: string, config: ProviderDiscoveryOptions | undefined): boolean {
+  return config?.modelInfoFormat === ModelInfoFormat.ModelsDev && supportsOpenAIReasoning(specifier)
+}
+
 export interface ModelFieldFilter {
   readonly field: string
   readonly equals?: string | number | boolean | null
@@ -8,7 +28,8 @@ export interface ModelFieldFilter {
 
 export interface ProviderDiscoveryOptions {
   readonly enabled: boolean
-  readonly endpoint: string
+  readonly endpoint?: string
+  readonly codexCatalog?: boolean
   readonly timeoutMs: number
   readonly includeRegex: RegExp[]
   readonly excludeRegex: RegExp[]
@@ -73,7 +94,10 @@ export function parseProviderDiscoveryOptions(raw: unknown): ProviderDiscoveryOp
   if (value.enabled !== true) return undefined
 
   const models = object(value.models)
-  const endpoint = typeof value.endpoint === "string" && value.endpoint.startsWith("/") ? value.endpoint : "/v1/models"
+  const codexCatalog = value.codexCatalog === true
+  const endpoint = typeof value.endpoint === "string" && value.endpoint.startsWith("/")
+    ? value.endpoint
+    : codexCatalog ? undefined : "/v1/models"
   const timeoutMs = typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) && value.timeoutMs > 0
     ? Math.max(1_000, Math.floor(value.timeoutMs))
     : 5_000
@@ -98,6 +122,7 @@ export function parseProviderDiscoveryOptions(raw: unknown): ProviderDiscoveryOp
   return {
     enabled: true,
     endpoint,
+    ...(codexCatalog ? { codexCatalog: true } : {}),
     timeoutMs,
     includeRegex: regexes(models?.includeRegex),
     excludeRegex: regexes(models?.excludeRegex),

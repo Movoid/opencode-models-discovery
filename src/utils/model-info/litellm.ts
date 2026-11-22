@@ -1,23 +1,26 @@
 import type { LiteLLMModelInfo, LiteLLMModelInfoEntry } from '../../types'
-import type { ModelEnricher, ModelEnrichmentResult } from '../../core/model-enrichment'
-import { createModelLimits, type NormalizedModelLimit } from '../../core/model-types'
+import { enrichmentLimits, type ModelEnricher, type ModelEnrichmentContext, type ModelEnrichmentResult } from '../../core/model-enrichment'
+import type { ModelLimitDraft } from '../../core/model-types'
 
 function hasUsableNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }
 
 function modelInfoScore(modelId: string, entry: LiteLLMModelInfoEntry): number {
   const info = entry.model_info ?? {}
+  const name = typeof entry.model_name === 'string' ? entry.model_name : undefined
+  const key = typeof info.key === 'string' ? info.key : undefined
+  const upstream = typeof entry.litellm_params?.model === 'string' ? entry.litellm_params.model : undefined
   const modelIdLower = modelId.toLowerCase()
   let score = 0
-  if (entry.model_name === modelId) score += 8
-  if (info.key === modelId) score += 6
-  if (entry.litellm_params?.model === modelId) score += 4
-  if (entry.litellm_params?.model?.endsWith(`/${modelId}`)) score += 2
-  if (entry.model_name?.toLowerCase() === modelIdLower) score += 3
-  if (info.key?.toLowerCase() === modelIdLower) score += 2
-  if (entry.litellm_params?.model?.toLowerCase() === modelIdLower) score += 2
-  if (entry.litellm_params?.model?.toLowerCase().endsWith(`/${modelIdLower}`)) score += 1
+  if (name === modelId) score += 8
+  if (key === modelId) score += 6
+  if (upstream === modelId) score += 4
+  if (upstream?.endsWith(`/${modelId}`)) score += 2
+  if (name?.toLowerCase() === modelIdLower) score += 3
+  if (key?.toLowerCase() === modelIdLower) score += 2
+  if (upstream?.toLowerCase() === modelIdLower) score += 2
+  if (upstream?.toLowerCase().endsWith(`/${modelIdLower}`)) score += 1
   if (info.mode === 'chat') score += 5
   if (hasUsableNumber(info.max_input_tokens) || hasUsableNumber(info.max_tokens)) score += 10
   if (info.supports_reasoning === true) score += 4
@@ -29,9 +32,9 @@ function buildModelInfoMap(entries: LiteLLMModelInfoEntry[]): Map<string, LiteLL
 
   for (const entry of entries) {
     const keys = new Set<string>()
-    if (entry.model_name) keys.add(entry.model_name)
-    if (entry.model_info?.key) keys.add(entry.model_info.key)
-    if (entry.litellm_params?.model) {
+    if (typeof entry?.model_name === 'string') keys.add(entry.model_name)
+    if (typeof entry?.model_info?.key === 'string') keys.add(entry.model_info.key)
+    if (typeof entry?.litellm_params?.model === 'string') {
       keys.add(entry.litellm_params.model)
       const parts = entry.litellm_params.model.split('/')
       if (parts.length > 1) keys.add(parts.slice(1).join('/'))
@@ -52,7 +55,7 @@ function buildModelInfoMap(entries: LiteLLMModelInfoEntry[]): Map<string, LiteLL
 }
 
 function createReasoningVariants(info: LiteLLMModelInfo): Record<string, any> | undefined {
-  if (info.supports_reasoning !== true || !info.supported_openai_params?.includes('reasoning_effort')) {
+  if (info.supports_reasoning !== true || !Array.isArray(info.supported_openai_params) || !info.supported_openai_params.includes('reasoning_effort')) {
     return undefined
   }
 
@@ -83,7 +86,7 @@ function getModalities(value: unknown): string[] | undefined {
   return modalities.length > 0 ? modalities : undefined
 }
 
-function buildModalities(info: LiteLLMModelInfo): { input: string[]; output: string[] } | undefined {
+function buildModalities(info: LiteLLMModelInfo, independent: boolean): { input: string[]; output: string[] } | undefined {
   const input = getModalities(info.modalities?.input)
   const output = getModalities(info.modalities?.output)
   const inputDeclared = Array.isArray(info.modalities?.input)
@@ -91,7 +94,7 @@ function buildModalities(info: LiteLLMModelInfo): { input: string[]; output: str
 
   // A declared side that normalizes to nothing leaves no trustworthy signal: treat the whole
   // declaration as absent instead of inferring a modality the provider never confirmed.
-  if ((inputDeclared && input === undefined) || (outputDeclared && output === undefined)) return undefined
+  if (!independent && ((inputDeclared && input === undefined) || (outputDeclared && output === undefined))) return undefined
   if (input || output) {
     return { input: input ?? ['text'], output: output ?? ['text'] }
   }
@@ -153,14 +156,15 @@ function getExplicitOutputLimit(info: LiteLLMModelInfo, contextLimit: number | u
   return undefined
 }
 
-function getLiteLLMModelInfo(entry: LiteLLMModelInfoEntry | undefined): ModelEnrichmentResult {
+function getLiteLLMModelInfo(entry: LiteLLMModelInfoEntry | undefined, context: ModelEnrichmentContext): ModelEnrichmentResult {
   const info = entry?.model_info
   if (!info) return {}
 
   const result: {
     metadataName?: string
     modalities?: { input: string[]; output: string[] }
-    limit?: NormalizedModelLimit
+    limit?: ModelLimitDraft
+    fallbackLimit?: ModelLimitDraft
     reasoning?: boolean
     variants?: Record<string, any>
     cost?: Record<string, unknown>
@@ -171,7 +175,7 @@ function getLiteLLMModelInfo(entry: LiteLLMModelInfoEntry | undefined): ModelEnr
   const displayName = info.display_name
   if (typeof displayName === 'string' && displayName.trim().length > 0) result.metadataName = displayName
 
-  const modalities = buildModalities(info)
+  const modalities = buildModalities(info, context.deferLimitNormalization === true)
   if (modalities) {
     result.modalities = modalities
   }
@@ -181,9 +185,13 @@ function getLiteLLMModelInfo(entry: LiteLLMModelInfoEntry | undefined): ModelEnr
     : (hasUsableNumber(info.max_tokens) ? info.max_tokens : undefined)
   const inputLimit = hasUsableNumber(info.max_input_tokens) ? info.max_input_tokens : undefined
   const explicitOutput = getExplicitOutputLimit(info, contextLimit)
-  const limits = createModelLimits(contextLimit, explicitOutput, inputLimit)
+  // LiteLLM's input cap (or overloaded max_tokens) is not a declared context.
+  const limits = enrichmentLimits(context, context.deferLimitNormalization ? undefined : contextLimit, explicitOutput, inputLimit)
   if (limits) {
     result.limit = limits
+  }
+  if (context.deferLimitNormalization && contextLimit !== undefined) {
+    result.fallbackLimit = { context: contextLimit }
   }
 
   if (info.supports_reasoning === true) {
@@ -229,7 +237,7 @@ export function createLiteLLMEnricher(
       if (context.filterNonChat && typeof mode === 'string' && mode.length > 0 && mode !== 'chat') {
         return { skip: true }
       }
-      return getLiteLLMModelInfo(entry)
+      return getLiteLLMModelInfo(entry, context)
     },
   }
 }

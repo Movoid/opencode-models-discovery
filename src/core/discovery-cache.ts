@@ -8,6 +8,7 @@ export interface DiscoveryCacheIdentity {
   readonly endpoint: string
   readonly modelInfoFormat?: string
   readonly modelInfoEndpoint?: string
+  readonly limitComposition?: 'field-local'
 }
 
 export interface DiscoveryCacheEntry {
@@ -51,6 +52,7 @@ export function parseDiscoveryCacheEntry(
     entry.identity.endpoint !== identity.endpoint ||
     !sameOptional(entry.identity.modelInfoFormat, identity.modelInfoFormat) ||
     !sameOptional(entry.identity.modelInfoEndpoint, identity.modelInfoEndpoint) ||
+    entry.identity.limitComposition !== identity.limitComposition ||
     !isDiscoveryCacheFresh(entry.fetchedAt, ttlSeconds, now) ||
     !Array.isArray(entry.rawModels) ||
     !entry.enrichments || typeof entry.enrichments !== 'object' || Array.isArray(entry.enrichments)) {

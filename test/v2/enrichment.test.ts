@@ -264,7 +264,7 @@ describe("V2 provider discovery with metadata enrichment", () => {
         ],
       })
       expect(models.get("unlisted-provider-model")).toMatchObject({
-        limit: { context: 200_000, output: 32_000 },
+        limit: { context: 200_000, input: 16_000, output: 4_000 },
         cost: [{ input: 0, output: 0.25 }],
       })
     } finally {

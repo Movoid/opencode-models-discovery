@@ -1,9 +1,5 @@
-import type { ModelEnricher } from '../../core/model-enrichment'
+import { inlineFormatLimits, type ModelEnricher } from '../../core/model-enrichment'
 import type { ModelLimitDraft } from '../../core/model-types'
-
-function hasUsableNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-}
 
 function parseNonNegativeNumber(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
@@ -60,10 +56,7 @@ function getReasoningVariants(rawModel: Record<string, unknown>): Record<string,
 
 export function createBifrostEnricher(_data: unknown): ModelEnricher {
   return {
-    enrich(model) {
-      const context = model.context_length
-      const input = model.max_input_tokens
-      const output = model.max_output_tokens
+    enrich(model, options) {
       const result: {
         metadataName?: string
         limit?: ModelLimitDraft
@@ -73,13 +66,8 @@ export function createBifrostEnricher(_data: unknown): ModelEnricher {
         variants?: Record<string, { reasoningEffort: string }>
       } = {}
 
-      if (hasUsableNumber(context)) {
-        result.limit = {
-          context,
-          ...(hasUsableNumber(input) ? { input } : {}),
-          ...(hasUsableNumber(output) ? { output } : {}),
-        }
-      }
+      const limit = inlineFormatLimits(model, options)
+      if (limit) result.limit = limit
 
       const name = model.normalized_name
       if (typeof name === 'string' && name.length > 0) result.metadataName = name

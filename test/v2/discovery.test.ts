@@ -12,6 +12,14 @@ const options = new Map([["local", parseProviderDiscoveryOptions({
 })!]])
 
 describe("V2 provider discovery", () => {
+  it("retains a format-specific output budget without a usable context", async () => {
+    const config = parseProviderDiscoveryOptions({ enabled: true, modelInfoFormat: "openrouter" })!
+    const provider = { id: "local", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: "http://localhost/v1" } }
+    const list = async () => Response.json({ data: [{ id: "chat", top_provider: { max_completion_tokens: 1579 } }] })
+    const models = await discoverInventory([provider], new Map([[provider.id, config]]), list)
+    expect(models.get(provider.id)?.get("chat")?.limit).toEqual({ context: 200_000, output: 1579 })
+  })
+
   it("persists raw models in storage and reprocesses them on a fresh cache hit", async () => {
     const cache = new Map<string, unknown>()
     const storage = {
@@ -139,6 +147,35 @@ describe("V2 provider discovery", () => {
       headers: expect.any(Object),
     }))
     expect(inventory.get("anthropic")?.get("claude-sonnet")?.modelID).toBe("claude-sonnet")
+  })
+
+  it("publishes healthy models without waiting for metadata after another provider disconnects", async () => {
+    const settings = { baseURL: "http://127.0.0.1:9000/v1" }
+    const providers = ["healthy", "down"].map(id => ({ id, package: "@opencode/ai/providers/google", settings }))
+    const discovery = new Map([
+      ["healthy", parseProviderDiscoveryOptions({ enabled: true, endpoint: "/healthy" })!],
+      ["down", parseProviderDiscoveryOptions({ enabled: true, endpoint: "/down", modelInfoFormat: "litellm", modelInfoEndpoint: "/waiting" })!],
+    ])
+    let release!: (response: Response) => void
+    const held = new Promise<Response>(resolve => { release = resolve })
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      switch (new URL(String(input)).pathname) {
+        case "/waiting": return held
+        case "/down": throw new TypeError("connection closed")
+        case "/healthy": return Response.json({ data: [{ id: "available" }] })
+        default: throw new Error("unexpected request")
+      }
+    })
+    const inventory = discoverInventory(providers, discovery, fetcher)
+    try {
+      // The list fixtures settle without I/O; leave the metadata gate closed for this turn.
+      const beforeRelease = await Promise.race([inventory, new Promise<undefined>(resolve => setImmediate(() => resolve(undefined)))])
+      expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toContain("/waiting")
+      expect(beforeRelease?.get("healthy")?.has("available")).toBe(true)
+    } finally {
+      release(Response.json({ data: [] }))
+      await inventory
+    }
   })
 
   it("continues discovery when another provider fails", async () => {

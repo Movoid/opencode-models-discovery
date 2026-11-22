@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import plugin from "../../src/v2/index.js"
 
+vi.mock("../../src/v2/codex-client-version.js", () => ({ codexClientVersion: () => "0.171.0" }))
+
 function closedEvents() {
   return { subscribe: vi.fn().mockReturnValue({
     async *[Symbol.asyncIterator]() {},
@@ -246,6 +248,123 @@ describe("V2 plugin entrypoint", () => {
       expect(fetcher).toHaveBeenCalledTimes(3)
     } finally {
       fetcher.mockRestore()
+    }
+  })
+
+  it("never resolves or publishes an OAuth credential for a Codex gateway", async () => {
+    const fetcher = vi.spyOn(globalThis, "fetch")
+    const connection = {
+      active: vi.fn().mockResolvedValue({ type: "credential", method: "oauth", id: "fake-oauth" }),
+      resolve: vi.fn().mockResolvedValue({ type: "oauth", access: "must-not-forward" }),
+    }
+    const makeProvider = () => ({
+      id: "cpa", package: "@opencode/ai/providers/openai-compatible-responses", integrationID: "official",
+      settings: { baseURL: "https://cpa.example/v1", apiKey: "must-not-fall-back", integrationID: "ignored-setting", modelsDiscovery: { enabled: true, codexCatalog: true } },
+    })
+    const providerUpdate = vi.fn()
+    const methodUpdate = vi.fn()
+    let transform: (editor: unknown) => void = () => {}
+    const ctx = context({ provider: {
+      list: async () => ({ data: [makeProvider()] }),
+      transform: async (callback: typeof transform) => { transform = callback },
+      reload: async () => transform({ get: () => ({ provider: makeProvider(), models: new Map() }), update: providerUpdate, models: { set: vi.fn() } }),
+    }, integration: { ...context().integration, connection,
+      transform: async (callback: (editor: unknown) => void) => callback({ method: { update: methodUpdate } }),
+    } })
+    try {
+      const stop = await plugin.setup(ctx as never)
+      expect(connection.active).toHaveBeenCalledWith("official")
+      expect(connection.resolve).not.toHaveBeenCalled()
+      expect(fetcher).not.toHaveBeenCalled()
+      expect(providerUpdate).not.toHaveBeenCalled()
+      expect(methodUpdate).not.toHaveBeenCalled()
+      stop?.()
+    } finally {
+      fetcher.mockRestore()
+    }
+  })
+
+  it("queries a local Codex gateway anonymously only when no credential is configured", async () => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) =>
+      new URL(String(url)).searchParams.has("client_version")
+        ? Response.json({ models: [{ slug: "local-model", context_window: 100_000 }] })
+        : Response.json({ data: [{ id: "local-model" }] }),
+    )
+    const ctx = context()
+    ctx.provider.list.mockResolvedValue({ data: [{
+      id: "local", package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "http://127.0.0.1:1234/v1", modelsDiscovery: { enabled: true, codexCatalog: true } },
+    }] })
+    try {
+      const stop = await plugin.setup(ctx as never)
+      expect(ctx.integration.connection.resolve).not.toHaveBeenCalled()
+      expect(fetcher).toHaveBeenCalled()
+      expect(fetcher.mock.calls.every(([, init]) => !new Headers(init?.headers).has("authorization"))).toBe(true)
+      stop?.()
+
+      fetcher.mockClear()
+      ctx.integration.connection.active.mockResolvedValue({ type: "env", name: "UNAVAILABLE_GATEWAY_KEY" })
+      const stopUnresolved = await plugin.setup(ctx as never)
+      expect(fetcher).not.toHaveBeenCalled()
+      stopUnresolved?.()
+    } finally {
+      fetcher.mockRestore()
+    }
+  })
+
+  it("publishes the active account’s models and drops stale models on list failure", async () => {
+    let key = "key-a"
+    let unavailable = false
+    const gateway = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      if (unavailable) return new Response(null, { status: 503 })
+      const endpoint = new URL(String(url))
+      const id = key === "key-a" ? "old-model" : "new-model"
+      return endpoint.searchParams.has("client_version")
+        ? Response.json({ models: [{ slug: id, context_window: 300_000, supported_reasoning_levels: [{ effort: "max" }] }] })
+        : Response.json({ data: [{ id }] })
+    })
+    const source = {
+      id: "cpa", package: "@opencode/ai/providers/openai-compatible-responses",
+      settings: { baseURL: "https://cpa.example/v1", apiKey: "fallback-key", modelsDiscovery: { enabled: true, codexCatalog: true } },
+    }
+    let fold: (editor: unknown) => void = () => {}
+    const visible = new Map<string, unknown>()
+    const rpcHandlers: Record<string, (...args: unknown[]) => Promise<unknown>> = {}
+    const ctx = context({
+      provider: {
+        ...context().provider,
+        list: async () => ({ data: [source] }),
+        reload: async () => {
+          visible.clear()
+          fold({ provider: { get: () => ({ provider: source }) }, get: () => undefined,
+            update: (_provider: string, id: string, apply: (draft: object) => void) => {
+              const draft = {}
+              apply(draft)
+              visible.set(id, draft)
+            } })
+        },
+      },
+      model: { transform: async (callback: typeof fold) => { fold = callback } },
+      integration: { ...context().integration, connection: {
+        active: async () => ({ type: "credential", method: "key", id: key }),
+        resolve: async () => ({ type: "key", key }),
+      } },
+      rpc: { register: async (_definition: unknown, handlers: typeof rpcHandlers) => Object.assign(rpcHandlers, handlers) },
+    })
+    let stop: (() => void) | undefined
+    try {
+      stop = await plugin.setup(ctx as never)
+      expect([...visible.keys()]).toEqual(["old-model"])
+      key = "key-b"
+      await rpcHandlers.refresh!({ force: true })
+      expect([...visible.keys()]).toEqual(["new-model"])
+      expect(visible.get("new-model")).toMatchObject({ limit: { context: 300_000 }, variants: [{ id: "max", settings: { reasoningEffort: "max" } }] })
+      unavailable = true
+      await rpcHandlers.refresh!({ force: true })
+      expect(visible.size).toBe(0)
+    } finally {
+      stop?.()
+      gateway.mockRestore()
     }
   })
 

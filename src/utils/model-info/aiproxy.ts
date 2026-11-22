@@ -1,5 +1,4 @@
-import type { ModelEnricher, ModelEnrichmentResult } from '../../core/model-enrichment'
-import { createModelLimits } from '../../core/model-types'
+import { enrichmentLimits, type ModelEnricher, type ModelEnrichmentResult } from '../../core/model-enrichment'
 import { createModelsDevEnricher } from './models-dev'
 
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -46,11 +45,11 @@ export function createAIProxyEnricher(data: unknown): ModelEnricher {
       const inputLimit = limits?.max_input_tokens
       const outputLimit = limits?.max_output_tokens
       const existingLimit = result.limit
-      if (existingLimit && positiveNumber(existingLimit.context) && (positiveNumber(inputLimit) || positiveNumber(outputLimit))) {
-        result.limit = createModelLimits(
-          existingLimit.context,
-          positiveNumber(outputLimit) ? outputLimit : existingLimit.output,
-          positiveNumber(inputLimit) ? inputLimit : existingLimit.input,
+      if ((context.deferLimitNormalization || positiveNumber(existingLimit?.context)) && (positiveNumber(inputLimit) || positiveNumber(outputLimit))) {
+        result.limit = enrichmentLimits(
+          context, existingLimit?.context,
+          positiveNumber(outputLimit) ? outputLimit : existingLimit?.output,
+          positiveNumber(inputLimit) ? inputLimit : existingLimit?.input,
         )
       }
 

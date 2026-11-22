@@ -31,7 +31,7 @@ export const DEFAULT_OUTPUT_TOKEN_LIMIT = 32_000
 export const DEFAULT_CONTEXT_TOKEN_LIMIT = 200_000
 
 export interface ModelLimitDraft {
-  readonly context: number
+  readonly context?: number
   readonly output?: number
   readonly input?: number
 }

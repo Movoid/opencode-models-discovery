@@ -20,6 +20,36 @@ function provider(id = "local") {
 }
 
 describe("V2 provider controller", () => {
+  it("keeps existing definitions and gives the Codex model editor owned copies", async () => {
+    const source = { ...provider(), codexCatalog: true, apiKey: "dummy", pruneMissing: true }
+    const controller = createProviderController({ provider: { reload: vi.fn() }, model: { reload: vi.fn() } } as never, [source], id => id)
+    const discovered = inventory("new")
+    const models = discovered.get("local")!
+    const model = models.get("new")!
+    models.set("new", { ...model, variants: [{ id: "high", settings: { reasoningEffort: "high" } }] })
+    models.set("existing", { ...model, id: "existing", modelID: "existing" })
+    await controller.replaceInventory(discovered, [source])
+
+    const update = vi.fn((_provider, _model, apply) => {
+      const draft: { variants?: Array<{ settings: Record<string, unknown> }> } = {}
+      apply(draft)
+      // The host is free to overlay a variant and freeze the model afterwards.
+      draft.variants![0]!.settings.reasoningEffort = "medium"
+      Object.freeze(draft.variants![0]!.settings)
+    })
+    const editor = {
+      provider: { get: () => ({ provider: source }) },
+      list: () => [{ id: "native-unlisted", modelID: "native-unlisted" }],
+      get: (_provider: string, id: string) => id === "existing" ? { id, modelID: "existing" } : undefined,
+      update,
+      remove: vi.fn(),
+    }
+    controller.transformModels(editor as never)
+    controller.transformModels(editor as never)
+    expect(update.mock.calls.map(([, id]) => id)).toEqual(["new", "new"])
+    expect(editor.remove).not.toHaveBeenCalled()
+    expect(controller.getInventory().get("local")?.get("new")?.variants?.[0]?.settings.reasoningEffort).toBe("high")
+  })
   it("registers a zero-model provider and replays replacement inventory", async () => {
     const reload = vi.fn().mockResolvedValue(undefined)
     const added: Array<{ info: Record<string, unknown>; models: unknown[] }> = []

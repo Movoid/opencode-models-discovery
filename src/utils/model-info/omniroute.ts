@@ -1,8 +1,4 @@
-import type { ModelEnricher } from '../../core/model-enrichment'
-
-function hasUsableNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-}
+import { inlineFormatLimits, type ModelEnricher } from '../../core/model-enrichment'
 
 function getModalities(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined
@@ -99,18 +95,10 @@ function getServiceTierVariants(
 
 export function createOmniRouteEnricher(_data: unknown): ModelEnricher {
   return {
-    enrich(model) {
-      const context = model.context_length
-      const inputLimit = model.max_input_tokens
-      const output = model.max_output_tokens
+    enrich(model, options) {
       const result: Record<string, unknown> = {}
-      if (hasUsableNumber(context)) {
-        result.limit = {
-          context,
-          ...(hasUsableNumber(inputLimit) ? { input: inputLimit } : {}),
-          ...(hasUsableNumber(output) ? { output } : {}),
-        }
-      }
+      const limit = inlineFormatLimits(model, options)
+      if (limit) result.limit = limit
 
       const capabilities = getCapabilities(model)
       const inputModalities = getModalities(model.input_modalities)

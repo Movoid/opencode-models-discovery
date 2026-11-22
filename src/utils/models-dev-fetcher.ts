@@ -18,71 +18,140 @@ export interface ModelsDevModel {
 }
 
 export const DEFAULT_MODELS_DEV_URL = 'https://models.dev/models.json'
+export const MODELS_DEV_PROVIDER_URL = 'https://models.dev/api.json'
 const PREFIX_MATCH_MIN_SCORE = 70
 const PREFIX_MATCH_MIN_SHARED_PARTS = 2
 
+type Row = Record<string, unknown>
+
+interface ModelsDevCatalog {
+  models: Map<string, Row>
+  /** null means ambiguous; undefined means absent. */
+  bareID(id: string): string | null | undefined
+  effortsFor(route: string): readonly string[] | undefined
+}
+
+const catalogCache = new Map<string, ModelsDevCatalog>()
 const modelsDevCaches = new Map<string, Map<string, ModelsDevModel>>()
 
-function isObject(value: unknown): value is Record<string, any> {
+function isObject(value: unknown): value is Row {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function toModelId(providerId: string | undefined, modelId: string): string {
-  return providerId ? `${providerId}/${modelId}` : modelId
+function modelID(provider: string | undefined, id: string): string {
+  return provider && !id.includes('/') ? provider + '/' + id : id
 }
 
-function addModel(cache: Map<string, ModelsDevModel>, providerId: string | undefined, rawModel: Record<string, any>, fallbackModelId?: string): void {
-  const rawId = typeof rawModel.id === 'string' && rawModel.id.length > 0 ? rawModel.id : fallbackModelId
-  if (!rawId) {
-    return
+export function readModelsDevMetadata(row: Row): Omit<ModelsDevModel, 'id'> {
+  const { modalities, limit } = row
+  const strings = (list: unknown) => Array.isArray(list) ? list.filter((s): s is string => typeof s === 'string') : undefined
+  return {
+    name: typeof row.name === 'string' ? row.name : undefined,
+    attachment: typeof row.attachment === 'boolean' ? row.attachment : undefined,
+    reasoning: typeof row.reasoning === 'boolean' ? row.reasoning : undefined,
+    tool_call: typeof row.tool_call === 'boolean' ? row.tool_call : undefined,
+    structured_output: typeof row.structured_output === 'boolean' ? row.structured_output : undefined,
+    temperature: typeof row.temperature === 'boolean' ? row.temperature : undefined,
+    modalities: isObject(modalities) ? { input: strings(modalities.input), output: strings(modalities.output) } : undefined,
+    limit: isObject(limit) ? {
+      context: typeof limit.context === 'number' ? limit.context : undefined,
+      input: typeof limit.input === 'number' ? limit.input : undefined,
+      output: typeof limit.output === 'number' ? limit.output : undefined,
+    } : undefined,
   }
+}
 
-  const id = rawId.includes('/') ? rawId : toModelId(providerId, rawId)
-  cache.set(id, {
-    id,
-    name: typeof rawModel.name === 'string' ? rawModel.name : undefined,
-    attachment: typeof rawModel.attachment === 'boolean' ? rawModel.attachment : undefined,
-    reasoning: typeof rawModel.reasoning === 'boolean' ? rawModel.reasoning : undefined,
-    tool_call: typeof rawModel.tool_call === 'boolean' ? rawModel.tool_call : undefined,
-    structured_output: typeof rawModel.structured_output === 'boolean' ? rawModel.structured_output : undefined,
-    temperature: typeof rawModel.temperature === 'boolean' ? rawModel.temperature : undefined,
-    modalities: isObject(rawModel.modalities) ? {
-      input: Array.isArray(rawModel.modalities.input) ? rawModel.modalities.input.filter((item: unknown): item is string => typeof item === 'string') : undefined,
-      output: Array.isArray(rawModel.modalities.output) ? rawModel.modalities.output.filter((item: unknown): item is string => typeof item === 'string') : undefined,
-    } : undefined,
-    limit: isObject(rawModel.limit) ? {
-      context: typeof rawModel.limit.context === 'number' ? rawModel.limit.context : undefined,
-      input: typeof rawModel.limit.input === 'number' ? rawModel.limit.input : undefined,
-      output: typeof rawModel.limit.output === 'number' ? rawModel.limit.output : undefined,
-    } : undefined,
-  })
+type Layout = 'flat' | 'provider' | 'mirror' | 'legacy'
+
+function* modelRows(data: unknown, layout: Layout): Generator<[key: string, row: Row, provider?: string]> {
+  if (!isObject(data)) return
+  for (const [key, value] of Object.entries(data)) {
+    // An error envelope must not become a cached bare mirror model.
+    if (!isObject(value) || (layout !== 'legacy' && key === 'error')) continue
+    const canNest = layout === 'legacy' || (layout === 'mirror' && !key.includes('/'))
+    if (layout === 'provider' || (canNest && isObject(value.models))) {
+      if (!isObject(value.models) || (layout !== 'legacy' && !key.trim())) continue
+      for (const [id, row] of Object.entries(value.models)) {
+        if (isObject(row)) yield [id, row, key]
+      }
+    } else yield [key, value]
+  }
 }
 
 function parseModelsDevData(data: unknown): Map<string, ModelsDevModel> {
-  const cache = new Map<string, ModelsDevModel>()
-
-  if (!isObject(data)) {
-    return cache
+  const models = new Map<string, ModelsDevModel>()
+  for (const [key, row, provider] of modelRows(data, 'legacy')) {
+    const rawID = typeof row.id === 'string' && row.id ? row.id : key
+    if (!rawID) continue
+    const id = modelID(provider, rawID)
+    models.set(id, { id, ...readModelsDevMetadata(row) })
   }
+  return models
+}
 
-  for (const [key, value] of Object.entries(data)) {
-    if (!isObject(value)) {
-      continue
-    }
-
-    if (isObject(value.models)) {
-      for (const [modelId, model] of Object.entries(value.models)) {
-        if (isObject(model)) {
-          addModel(cache, key, model, modelId)
-        }
-      }
-      continue
-    }
-
-    addModel(cache, undefined, value, key)
+function namedEfforts(options: unknown): readonly string[] | undefined {
+  if (!Array.isArray(options)) return
+  for (const option of options) {
+    if (!isObject(option) || option.type !== 'effort' || !Array.isArray(option.values)) continue
+    const choices = option.values.filter((s): s is string => typeof s === 'string' && !!s.trim())
+    if (choices.length || !option.values.length) return [...new Set(choices.filter(s => s !== 'default'))]
   }
+}
 
-  return cache
+type CatalogUse = 'both' | 'metadata' | 'efforts'
+
+function indexCatalog(data: unknown, layout: Layout, use: CatalogUse): ModelsDevCatalog | undefined {
+  const models = new Map<string, Row>()
+  const routes = new Map<string, Row[]>()
+  const bareIDs = new Map<string, string | null>()
+  const useRowID = layout === 'mirror' || use !== 'efforts'
+  for (const [key, row, provider] of modelRows(data, layout)) {
+    // Public efforts belong to routing keys. Mirrors use their projected model
+    // IDs for both metadata and efforts, including explicit IDs on alias rows.
+    const rawID = useRowID && typeof row.id === 'string' && row.id.trim() ? row.id : key
+    const id = modelID(provider, rawID)
+    const route = layout === 'mirror' ? id : provider ? provider + '/' + key : key
+    const slash = route.indexOf('/')
+    if (!rawID.trim() || (layout !== 'mirror' && (slash <= 0 || !route.slice(slash + 1).trim()))) continue
+    if (use !== 'efforts') models.set(id, row)
+    if (use === 'metadata') continue
+
+    const aliases = routes.get(route)
+    if (aliases) aliases.push(row)
+    else routes.set(route, [row])
+    if (!aliases && slash !== -1) {
+      const bare = route.slice(slash + 1)
+      bareIDs.set(bare, bareIDs.has(bare) ? null : route)
+    }
+  }
+  if (!models.size && !routes.size) return
+  return {
+    models,
+    bareID: id => routes.has(id) ? id : bareIDs.get(id),
+    effortsFor(route) {
+      const aliases = routes.get(route)
+      if (!aliases) return
+      const [first, ...others] = aliases.map(row => namedEfforts(row.reasoning_options))
+      // Aliases keep last-write metadata, but must agree on the effort choices.
+      if (first && others.every(list => list?.length === first.length && list.every(s => first.includes(s)))) return first
+    },
+  }
+}
+
+export async function fetchModelsDevCatalog(url = DEFAULT_MODELS_DEV_URL, privateFetcher?: typeof fetch, use: CatalogUse = 'both'): Promise<ModelsDevCatalog | undefined> {
+  const key = use + ':' + url
+  const cached = !privateFetcher && catalogCache.get(key)
+  if (cached) return cached
+  try {
+    const response = await (privateFetcher ?? fetch)(url, { method: 'GET', signal: AbortSignal.timeout(3000) })
+    if (response.status !== 200) return
+    const layout = url === DEFAULT_MODELS_DEV_URL ? 'flat' : url === MODELS_DEV_PROVIDER_URL ? 'provider' : 'mirror'
+    const catalog = indexCatalog(await response.json(), layout, use)
+    if (!privateFetcher && catalog) catalogCache.set(key, catalog)
+    return catalog
+  } catch {
+    return undefined
+  }
 }
 
 export async function fetchModelsDevData(url: string = DEFAULT_MODELS_DEV_URL): Promise<Map<string, ModelsDevModel>> {
@@ -138,10 +207,10 @@ function calculatePrefixScore(modelA: string, modelB: string): number {
   return Math.max(0, 100 - ((longer.length - shorter.length) * 10))
 }
 
-export function lookupModelsDevData(
+export function lookupModelsDevData<T>(
   modelId: string,
-  cache: Map<string, ModelsDevModel>
-): ModelsDevModel | undefined {
+  cache: Map<string, T>
+): T | undefined {
   let cleanId = modelId.replace(/:[a-zA-Z0-9_-]+$/g, '')
   const parts = cleanId.split('/')
   if (parts.length > 2) {
@@ -152,7 +221,7 @@ export function lookupModelsDevData(
   if (exactMatch) return exactMatch
 
   const requestedModelLower = splitModelId(cleanId).model.toLowerCase()
-  const allCandidates: Array<[string, ModelsDevModel]> = []
+  const allCandidates: Array<[string, T]> = []
 
   for (const [key, value] of cache.entries()) {
     const candidate = splitModelId(key)
@@ -164,7 +233,7 @@ export function lookupModelsDevData(
   if (exactModelMatches.length === 1) return exactModelMatches[0]?.[1]
   if (exactModelMatches.length > 1) return undefined
 
-  let bestMatch: ModelsDevModel | undefined
+  let bestMatch: T | undefined
   let bestScore = 0
   let bestScoreMatches = 0
 
@@ -186,5 +255,6 @@ export const modelsDevTestUtils = {
   parseModelsDevData,
   resetCache(): void {
     modelsDevCaches.clear()
+    catalogCache.clear()
   },
 }

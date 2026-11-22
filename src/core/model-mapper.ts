@@ -96,6 +96,12 @@ function mapV1Variant(id: string, value: unknown): {
   }
 }
 
+function usableModalities(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const names = value.filter((item): item is string => typeof item === 'string' && !!item.trim())
+  return names.length ? names : undefined
+}
+
 /** Projects a shared discovery draft into the V2 model catalog shape. */
 export function mapToDiscoveredV2Model(
   draft: DiscoveredModelDraft,
@@ -106,18 +112,10 @@ export function mapToDiscoveredV2Model(
 
   const name = options.smartModelName ? resultDraft.name : resultDraft.id
 
-  const capabilities: Record<string, unknown> = {
+  const capabilities = {
     tools: resultDraft.toolCall !== false && resultDraft.capabilities?.tools !== false,
-  }
-
-  const inputModalities = resultDraft.modalities?.input ?? resultDraft.capabilities?.input ?? ['text']
-  if (Array.isArray(inputModalities) && inputModalities.length > 0) {
-    capabilities.input = inputModalities
-  }
-
-  const outputModalities = resultDraft.modalities?.output ?? resultDraft.capabilities?.output ?? ['text']
-  if (Array.isArray(outputModalities) && outputModalities.length > 0) {
-    capabilities.output = outputModalities
+    input: usableModalities(resultDraft.modalities?.input) ?? usableModalities(resultDraft.capabilities?.input) ?? ['text'],
+    output: usableModalities(resultDraft.modalities?.output) ?? usableModalities(resultDraft.capabilities?.output) ?? ['text'],
   }
 
   const rawLimit = resultDraft.limit

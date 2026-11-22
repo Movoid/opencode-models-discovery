@@ -1,5 +1,5 @@
-import type { ModelEnricher, ModelEnricherDeferredContext } from '../../core/model-enrichment'
-import { createModelLimits } from '../../core/model-types'
+import { enrichmentLimits, type ModelEnricher, type ModelEnricherDeferredContext } from '../../core/model-enrichment'
+import type { ModelLimitDraft } from '../../core/model-types'
 import { buildModelInfoURL } from '../../core/model-info-url'
 
 export const DEFAULT_OLLAMA_ENDPOINT = '/api/show'
@@ -7,7 +7,8 @@ export const DEFAULT_OLLAMA_CONCURRENCY = 4
 const DEFAULT_OLLAMA_TIMEOUT_MS = 5000
 
 interface ParsedOllamaMetadata {
-  readonly contextLength?: number
+  readonly runtimeContext?: number
+  readonly fallbackContext?: number
   readonly capabilities: ReadonlySet<string>
 }
 
@@ -16,7 +17,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function positiveNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
 function parseCapabilities(value: unknown): ReadonlySet<string> {
@@ -32,8 +33,8 @@ function parseCapabilities(value: unknown): ReadonlySet<string> {
 }
 
 /**
- * Reads num_ctx from Ollama's Modelfile-style parameters string. Accepts the
- * forms returned by different Ollama versions: "num_ctx 4096",
+ * Reads a complete num_ctx value from a Modelfile-style parameters line.
+ * Retains the existing supported forms: "num_ctx 4096",
  * "num_ctx: 8192", and "\"num_ctx\": 16384".
  */
 function parseNumCtx(parameters: unknown): number | undefined {
@@ -42,22 +43,16 @@ function parseNumCtx(parameters: unknown): number | undefined {
   }
   if (typeof parameters !== 'string') return undefined
 
-  const match = parameters.match(/(?:^|\n)\s*"?num_ctx"?\s*[:=]?\s*(\d+)\b/i)
+  const match = parameters.match(/^[ \t]*"?num_ctx"?[ \t]*[:=]?[ \t]*(\d+)[ \t]*\r?$/im)
   return match ? positiveNumber(Number(match[1])) : undefined
 }
 
 /**
- * Resolves the effective context window.
- *
- * A num_ctx from the model's parameters is the only intentional runtime
- * context signal Ollama exposes, so it wins over architecture-derived values.
- * When it is absent, fall back to model_info.<architecture>.context_length,
- * then any *.context_length entry, then a top-level context_length.
+ * Resolves a fallback when the model parameters do not specify num_ctx:
+ * model_info.<architecture>.context_length, any *.context_length, then
+ * the top-level context_length field some providers expose.
  */
-function resolveContextLength(show: Record<string, unknown>): number | undefined {
-  const numCtx = parseNumCtx(show.parameters)
-  if (numCtx) return numCtx
-
+function resolveFallbackContext(show: Record<string, unknown>): number | undefined {
   const modelInfo = isRecord(show.model_info) ? show.model_info : undefined
   if (modelInfo) {
     const architecture = typeof modelInfo['general.architecture'] === 'string'
@@ -91,13 +86,11 @@ function parseShow(value: unknown): ParsedOllamaMetadata | undefined {
   if (!isRecord(value)) return undefined
 
   const capabilities = parseCapabilities(value.capabilities)
-  const contextLength = resolveContextLength(value)
-  if (contextLength === undefined && capabilities.size === 0) return undefined
+  const runtimeContext = parseNumCtx(value.parameters)
+  const fallbackContext = runtimeContext === undefined ? resolveFallbackContext(value) : undefined
+  if (runtimeContext === undefined && fallbackContext === undefined && capabilities.size === 0) return undefined
 
-  return {
-    ...(contextLength !== undefined ? { contextLength } : {}),
-    capabilities,
-  }
+  return { runtimeContext, fallbackContext, capabilities }
 }
 
 /**
@@ -171,14 +164,17 @@ export function createOllamaEnricher(options: ModelEnricherDeferredContext): Mod
       }
 
       const result: {
-        limit?: ReturnType<typeof createModelLimits>
+        limit?: ModelLimitDraft
+        fallbackLimit?: ModelLimitDraft
         modalities?: { input: string[]; output: string[] }
         reasoning?: boolean
         toolCall?: boolean
       } = {}
 
-      if (parsed.contextLength !== undefined) {
-        const limits = createModelLimits(parsed.contextLength)
+      if (context.deferLimitNormalization && parsed.fallbackContext !== undefined) {
+        result.fallbackLimit = { context: parsed.fallbackContext }
+      } else {
+        const limits = enrichmentLimits(context, parsed.runtimeContext ?? parsed.fallbackContext)
         if (limits) result.limit = limits
       }
 
